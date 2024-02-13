@@ -1,0 +1,750 @@
+---
+title: "Coverage analysis"
+output: 
+  html_document: 
+    toc: yes
+    fig_caption: yes
+---
+
+
+Investigate the effect of sequencing depth on methylation analyses. 
+
+Here, I downsampled the high-coverage pilot dataset as shown in the following table. 
+
+The increase in coverage is not fully proportional to the subsampling fraction due to a increase
+in duplicates. 
+
+Note, that for this analysis the methylation calls have been **destranded**.
+
+```{r}
+#| label: load_libraries
+#| echo: false
+
+library(tidyverse)
+library(purrr)
+library(glue)
+library(wheatearcommons)
+```
+
+
+```{r}
+#| label: set_config
+#| echo: false
+
+config <- list(
+    "subsampling_fractions" = c("0.125", "0.25", "0.5"),
+    "base_dir" = "/cluster/home/flamme/my-projects/wheatear-emseq-prod/results/wheatear_downsampling",
+    "base_dir_prod" = "/cluster/home/flamme/my-data/processed/by-analysis/wheatear_indGenome_bismark/"
+)
+```
+
+
+
+# Data
+
+
+In the pilot dataset, six samples were sequenced on a single NovaSeq lane, resulting in a theoretical coverage of 80X per sample, 
+based on a estimated output of 2e9 read pairs per lane and a genome size 1.3 Gbp. 
+
+For this benchmarking experiment, I downsampled the pilot dataset to 0.125, 0.25, and 0.5 of the nomincal sequencing depth. 
+
+The following table the sequencing depth achived by subsetting the inital pilot dataset. 
+
+Subsampling was perfomed on raw fastq files using the tool [fq](https://github.com/stjude-rust-labs/fq).
+```{r fraction, echo=F}
+df_mqc <- map(
+    config$subsampling_fractions,
+    function(frac) {
+        read_table_ssh(
+            glue("{config$base_dir}/frac-{frac}/multiqc/bismark/multiqc_data/multiqc_qualimap_bamqc_genome_results.txt")) |>
+            mutate("frac" = frac)
+    }
+) |>    
+    list_rbind()
+
+
+df_mqc |>
+    dplyr::select(mean_coverage, frac, Sample) |>
+    group_by(frac, Sample) |>
+    arrange(mean_coverage) |>
+    pivot_wider(id_cols = Sample, names_from = frac, values_from = mean_coverage) |>
+    # add means for each columns
+    mutate(across(starts_with("0."), ~ round(.x, 1)))
+```
+
+A simpler overview
+
+```{r, echo=F}
+df_mqc |>
+    dplyr::select(mean_coverage, frac) |>
+    group_by(frac) |>
+    summarize("mean coverage [min, max]" = paste0(
+        round(mean(mean_coverage), 1), " [ ",
+        round(min(mean_coverage), 1), " - ",
+        round(max(mean_coverage), 1), " ]"
+    ))
+```
+
+
+
+# CpGs recovered
+
+Next, I looked at what fraction of total genomic CpGs are recovered in the EM-seq datasets. 
+
+The number of CpGs at which methylation calls can be made is more correlated with lower sequencing depths.
+
+Saturation seems be slowly reached at coverage over 25X. 
+
+
+```{r, echo=F}
+df_cpg <- read_tsv("/home/fritjof/my-data/genomes/by-refmake/Oenanthe_melanoleuca/OenMel1.1/OenMel1.1/cpg_positions.bed.gz")
+
+n_cpgs_total <- df_cpg |> nrow()
+
+df_norm <- map(
+    config$subsampling_fractions,
+    function(frac) {
+        read_table_ssh(
+            glue(config$base_dir, "/frac-{frac}/methylkit/bismark/filtered_normalized.tsv")
+        ) |> mutate("frac" = frac)
+    }
+) |>
+    list_rbind() |>
+    relocate(frac)
+
+df_norm |>
+    left_join(df_mqc, by = c("sample" = "Sample", "frac" = "frac")) |>
+    ggplot(aes(x = mean_coverage, y = n_CpGs * 2 / n_cpgs_total)) +
+    geom_smooth() +
+    geom_point(aes(color = frac)) +
+    geom_hline(aes(yintercept = 1)) +
+    ylim(c(0, 1))
+```
+
+::: {.callout-important }
+In which regions of the genome are CpGs recovered and where not?
+:::
+
+# Methylation rates
+
+At lower sequencing depth, the inferred methylation rate is slightly higher than with higher coverage. Similar to the number of called mCpGs, there is almost no difference between the both dataset with higher coverage. 
+
+::: {.callout-important }
+
+ - What is the variance per coverage fraction?
+ - What is the natural ("genuine") variation between samples?
+
+:::
+
+
+```{r, echo=F}
+df_norm |>
+    left_join(df_mqc, by = c("sample" = "Sample", "frac" = "frac")) |>
+    ggplot(aes(x = mean_coverage, y = mean_mCpG, color = frac)) +
+    geom_point() +
+    ggrepel::geom_text_repel(aes(label = sample))
+
+
+df_norm |>
+    left_join(df_mqc, by = c("sample" = "Sample", "frac" = "frac")) |>
+    ggplot(aes(x = frac, y = mean_mCpG, color = frac)) +
+    geom_boxplot()
+
+
+```
+
+Now, load samples from the production sequencing run: 
+
+```{r, echo=F}
+fix_sample_names <- function(.data) {
+    # This function fixes the sample names in the given data frame.
+    # It removes the ".bismark.cov.gz" suffix from the sample names,
+    # and replaces specific patterns in the sample names with desired values.
+    #
+    # Args:
+    #   .data: A data frame containing the sample names to be fixed.
+    #
+    # Returns:
+    #   The modified data frame with fixed sample names.
+
+    .data |>
+        mutate(sample = str_remove(sample, ".bismark.cov.gz")) |>
+        mutate(sample = stringr::str_replace(sample, "OENDES-MO", "OENDES-MO_02_2020-3Y42903")) |>
+        mutate(sample = stringr::str_replace(sample, "GR-GAL-2019-014-REF", "GR-GAL-2019-014")) |>
+        mutate(sample = stringr::str_replace(sample, "OEN-CYP-20e", "OEN_CYP-20e")) |>
+        mutate(sample = stringr::str_replace(sample, "Oencyp", "    OEN_CYP-19e"))
+}
+
+df_norm_prod <- wheatearcommons::read_table_ssh(glue("{config$base_dir_prod}methylkit/bismark/filtered_normalized.tsv"), col_names = TRUE) |>
+    fix_sample_names() |>
+    left_join(wheatearcommons::sample_metadata)
+
+
+```
+
+
+## Coverage from bam files
+
+```{r}
+#| label: prod_data
+#| echo: false
+#| eval: false
+
+df_mosdepth_prod <-  map(
+    unique(df_norm_prod$sample),
+    function (sample) read_table_ssh(
+        glue("{config$base_dir_prod}/bams/{sample}/{sample}_pe.dedup.sort.coverage.mosdepth.summary.txt")
+    ) |> mutate(sample = sample)) |>
+    list_rbind()
+
+# create a string of the current date in format "YYYYMMDD"
+date <- format(Sys.Date(), "%Y%m%d")
+
+saveRDS(df_mosdepth_prod, glue("cache/{date}.df_mosdepth_prod.rds"))
+```
+
+
+Mean coverage per sample is different across chromosome classes. 
+
+```{r}
+#| label: plot_bam_coverage_prod
+#| echo: false
+
+df_mosdepth_prod <- readRDS(glue("../cache/20240209.df_mosdepth_prod.rds"))
+df_mosdepth_prod |>
+    # filter for real chromosomes
+    filter(str_starts(chrom, "chr")) |>
+    # join with genome data for OenMel1.1
+    left_join(df_genome |> filter(genome == "OenMel1.1") |> select(seqnames, seqclass), by = c("chrom" = "seqnames")) |>
+    group_by(sample, seqclass) |>
+    summarize(mean_coverage = mean(mean), .groups = "keep") |>
+    # calculate the mean coverage per seqclass
+    group_by(seqclass) |>
+    reframe(
+        sample = sample,
+        mean_coverage = mean_coverage,
+        mean_coverage_seqclass = mean(mean_coverage)) |>
+    ggplot(aes(x = reorder(sample,mean_coverage), y = mean_coverage)) +
+    geom_point() + 
+    # plot a horizontal line for the global mean coverage per seqclass
+    geom_hline(aes(yintercept = mean_coverage_seqclass), linetype = "dashed") +
+    facet_wrap(~seqclass, nrow = 3) + 
+    # hide text at x axis
+    theme(axis.text.x = element_blank()) 
+
+```
+
+The negative correlation between coverage and chromosome length varying between samples
+
+```{r}
+#| label: plot_bam_coverage_per_chrom_prod
+#| echo: false
+
+# plot a regression line for coverage across chromosomes, color by sample
+df_mosdepth_prod |>
+    filter(str_starts(chrom, "chr")) |>
+    filter(chrom != "chrM") |>
+    left_join(wheatearcommons::sample_metadata) |>
+    ggplot(aes(x = -length, y = mean, color = sample)) +
+    #geom_point() + 
+    geom_smooth(method = "lm",se=FALSE) + 
+    theme(legend.position = "none")
+
+# estimate the correlation coefficient between coverage and chromosome length for each sample
+df_mosdepth_prod_cor <- 
+    df_mosdepth_prod |>
+    filter(str_starts(chrom, "chr")) |>
+    filter(chrom != "chrM") |>
+    left_join(wheatearcommons::sample_metadata) |>
+    group_by(sample) |>
+    summarize(correlation = cor(-length, mean), .groups = "keep")
+
+df_mosdepth_prod_cor |>
+    arrange(correlation) |>
+    ggplot() + 
+    geom_density(aes(x = correlation)) +
+    ggtitle("Correlation coefficients between coverage and chromosome length")
+
+
+df_mosdepth_prod_cor |>
+    arrange(correlation) |>
+    # join with sample metadata
+    left_join(wheatearcommons::sample_metadata) |>
+    ggplot(aes(y = correlation, x=Species)) + 
+    geom_violin() + 
+    geom_boxplot(width = 0.1) +
+    ggtitle("Correlation coefficients between coverage and chromosome length")
+
+
+```
+
+
+::: {.callout-important }
+Is the coverage difference across chromosomes and across Species driven by repeat content?
+:::
+
+
+```{r}
+#| label: plot_bam_coverage_per_chrom_prod_lm   
+#| echo: false
+#| eval: false
+model <- function(df) lm(mean ~ length, data = df)
+
+df_mosdepth_prod |>
+    filter(str_starts(chrom, "chr")) |>
+    filter(chrom != "chrM")  |> 
+    # scale length and mean to a range of 0...1
+    group_by(sample) |>
+    mutate(
+        length = log10(length/max(length)),
+        mean = mean/max(mean))  |>
+    # plot regression lines
+    ggplot(aes(x = length, y = mean, group=sample)) +
+    geom_point() +
+    geom_smooth(method = "lm",se=FALSE) +
+    theme(legend.position = "none")
+
+df_mosdepth_prod_lm <- 
+    df_mosdepth_prod |>
+    filter(str_starts(chrom, "chr")) |>
+    filter(chrom != "chrM")  |> 
+    # scale length and mean to a range of 0...1
+    group_by(sample) |>
+    mutate(
+        length = log10(length/max(length)),
+        mean = mean/max(mean))  |>
+    drop_na() |> 
+    group_by(sample) |> 
+    nest() %>%
+    mutate(
+        fit = map(data, model),
+        tidied = map(fit, broom::tidy),
+        predicted = map(fit, predict), 
+        glanced = map(fit, broom::glance),
+        augmented = map(fit, broom::augment))
+
+df_mosdepth_prod_lm |> 
+    tidyr::unnest(tidied) |> filter(term == "length") |> ggplot(aes(x = estimate)) + geom_density()
+
+# calculate outliers of adjusted r-squared values according to 95% percentile
+df_mosdepth_prod_lm |> 
+    tidyr::unnest(tidied) |> 
+    ungroup() |>
+    mutate(
+        outlier05 = quantile(estimate, 0.05),
+        outlier95 = quantile(estimate, 0.95)) |>
+    filter(estimate < outlier05 | estimate > outlier95) |> pull(sample) -> regression_outlier_samples
+
+
+# replot regression line, exluding the outliers
+df_mosdepth_prod |>
+    filter(str_starts(chrom, "chr")) |>
+    filter(chrom != "chrM") |>
+    mutate(outlier = if_else(sample %in% regression_outlier_samples, "is_outlier", "not_outlier")) |>
+    left_join(wheatearcommons::sample_metadata) |>
+    ggplot(aes(x = -length, y = mean, group=sample, color = outlier)) +
+    #geom_point() + 
+    geom_smooth(method = "lm",se=FALSE) + 
+    theme(legend.position = "none")
+    
+```
+
+## Test coverage in single-copy regions
+
+```{r}
+#| label: plot_bam_coverage_per_chrom_prod_single_copy
+#| echo: false
+
+
+
+
+```
+
+
+
+# Methylation levels per sample 
+
+Relationship between coverage and methylation levels are stable at 0.25 and 0.5 fractions, 
+but somewhat more spurious in the 0.125 fraction.
+
+```{r, echo=F}
+df_norm |>
+    left_join(df_mqc, by = c("sample" = "Sample", "frac" = "frac")) |>
+    ggplot(aes(x = reorder(sample, mean_coverage), y = mean_mCpG, color = frac)) +
+    geom_point() +
+    geom_line(aes(group = frac)) +
+    coord_flip() #   + facet_grid(~frac)
+
+df_mqc |>
+    select(Sample, frac, mean_coverage) |>
+    pivot_wider(id_cols = Sample, names_from = "frac", values_from = mean_coverage) |>
+    knitr::kable()
+```
+
+
+```{r eval=FALSE, include=FALSE}
+
+library(GenomicRanges)
+
+map(config$subsampling_fractions,
+  ~ system(glue(
+    "rsync euler.ethz.ch:/cluster/home/flamme/my-projects/wheatear-emseq-prod/results/wheatear_downsampling/frac-{.x}/methylkit/bismark/filtered_normalized.rds data/frac-{.x}/filtered_normalized.rds")
+    )
+)
+```
+
+
+```{r}
+
+
+
+mk_norm <- 
+    paste("frac", config$subsampling_fractions, sep="-") |>
+    map( ~ readRDS(glue("data/{.x}/filtered_normalized.rds"))) |>
+    setNames(paste("frac", config$subsampling_fractions, sep="-"))
+
+sample_names <- map(mk_norm, ~ methylKit::getSampleID(.x)) |> unique() |> unlist()
+
+
+
+df_frac <- imap(sample_names,
+    function (samplename, sample_idx) {
+        map(
+            paste("frac", config$subsampling_fractions, sep="-"),
+            function (frac) {
+                methylKit::getData(mk_norm[[frac]][[sample_idx]]) |>
+                #head(100) |>
+                mutate(
+                    sample = samplename,
+                    subset_frac = str_remove(frac, "`")
+                ) 
+            }
+        )  |> compact() |> list_rbind() 
+    }
+) |> list_rbind()
+
+
+#' This function plots the fraction correlation between two variables for a specific sample and sequence.
+#'
+#' @param .data The data frame containing the relevant data.
+#' @param samplename The name of the sample to filter the data for.
+#' @param seqname The name of the sequence to filter the data for.
+#' @param x The name of the variable to plot on the x-axis.
+#' @param y The name of the variable to plot on the y-axis.
+plot_frac_correlation <- function(.data,
+    samplename,
+    seqname,
+    x,
+    y,
+    filename = "results/{samplename}-fraccor-{seqname}-{fname_part}.png") {
+    .data |>
+        dplyr::filter(sample == samplename) |>
+        dplyr::filter(seqnames == seqname) |>
+        # calculate mCpG
+        mutate(mCpG = numCs / coverage) |>
+        select(seqnames, start, coverage, mCpG, sample, subset_frac) |>
+        pivot_wider(id_cols = c(seqnames, start), names_from = subset_frac, values_from = mCpG) |> 
+        ggplot(aes(
+            x=!!sym(x),
+            y=!!sym(y))
+        ) + 
+        geom_point() + 
+        geom_smooth(method="lm") + 
+        ggtitle(glue("{samplename} - {y} vs {x}"), seqname) -> p
+
+        gc() 
+
+        fname_part <- paste(str_extract(x, "[0-9\\.]+"), "-", str_extract(y, "[0-9\\.]+"), sep="")
+        
+        ggsave( glue(filename), p)
+}
+
+#
+plot_frac_correlation_by_pos <- function(.data,
+    samplename,
+    seqname,
+    x,
+    y,
+    filename = "results/{samplename}-fraccor_pos-{seqname}-{fname_part}.png"
+    ) {
+    
+    seqlength <- wheatearcommons::df_genome |> 
+        dplyr::filter(genome == "OenMel1.1", 
+        seqnames == seqname) |> 
+        dplyr::pull(seqlength)
+
+    .data |>
+        dplyr::filter(sample == samplename) |>
+        dplyr::filter(str_starts(chr, "chr")) |>
+        left_join(
+            wheatearcommons::df_genome |> dplyr::filter(genome == "OenMel1.1") |> select(seqnames, seqlength),
+            by=c("chr" = "seqnames")
+        ) |>
+        #dplyr::filter(str_detect(chr, seqname)) |>
+        # calculate mCpG
+        mutate(
+            mCpG = numCs / coverage,
+            #start = round(start/seqlength*100),5)
+            ) |> 
+        select(chr, start, coverage, mCpG, sample, subset_frac) |>
+        filter(subset_frac %in% c(x, y)) |>
+        group_by(chr, subset_frac) |>
+        mutate(bin = cut_width(start, width=1e6, labels=FALSE)) |> 
+        group_by(bin,chr, subset_frac) |>
+        summarize(mCpG = mean(mCpG)) |> 
+        pivot_wider(id_cols = c(chr, bin), names_from = subset_frac, values_from = mCpG) |> 
+        # caluclate difference between fractions 
+        ggplot(aes(
+            x=bin,
+            y=chr,
+            fill=!!sym(y) - !!sym(x))
+        ) + 
+        # add a diverging continuous scale
+        scale_fill_viridis_c() + 
+        geom_tile() + 
+        ggtitle(samplename)
+
+        gc() 
+
+        fname_part <- paste(str_extract(x, "[0-9\\.]+"), "-", str_extract(y, "[0-9\\.]+"), sep="")
+        
+        ggsave( glue(filename), p)
+}
+
+
+chromosome_list <- wheatearcommons::df_genome |> 
+        dplyr::filter(genome == "OenMel1.1") |> 
+        dplyr::filter(str_starts(seqnames, "chr")) |>
+        pull(seqnames)
+
+map(chromosome_list,
+        function (.seqname) {
+        map(
+            apply(combn(paste("frac", config$subsampling_fractions, sep="-"), 2),2,list),
+            ~ plot_frac_correlation(df_frac, "IRARD6",
+                seqname = .seqname,
+                x = as.character(.x[[1]][[1]]),
+                y = as.character(.x[[1]][[2]]))
+            )
+        }
+)
+
+
+map(
+    apply(combn(paste("frac", config$subsampling_fractions, sep="-"), 2),2,list),
+    ~ plot_frac_correlation_by_pos(df_frac, "ITGRA1",
+        seqname = .seqname,
+        x = as.character(.x[[1]][[1]]),
+        y = as.character(.x[[1]][[2]]))
+    )
+}
+)
+
+
+
+plot_frac_correlation
+
+
+
+```
+
+
+```{r
+
+
+gr_repeats <- readRDS("../wheatear-methylomics-analyze/data-cache/genome-annotation-repeats.rds")
+
+gr_genes <- readRDS("../wheatear-methylomics-analyze/data-cache/genome-annotation-genes.rds")
+
+
+mk_all <- mk_norm[["frac-0.125"]][[1]]
+df_all <- methylKit::getData(mk_all)
+gr_all <- GenomicRanges::makeGRangesFromDataFrame(df_all, keep.extra.columns = T)
+
+df_frac_repeats <- 
+    imap(c("ITGRA1"),
+        function (samplename, sample_idx) {
+            map(
+                paste("frac", config$subsampling_fractions, sep="-"),
+                function (frac) {
+                    
+                    .mk_for_sample  <- mk_norm[[frac]][[sample_idx]]
+                    # convert to datafraeme
+                    .df_for_sample <- methylKit::getData(.mk_for_sample)
+                    # convert to Granges
+                    .gr_for_sample <- GenomicRanges::makeGRangesFromDataFrame(.df_for_sample, keep.extra.columns = T)
+
+                    .mk_subset_region <- plyranges::join_overlap_intersect(
+                        .gr_for_sample,
+                        gr_repeats) |> unique()
+
+                    GenomicRanges::as.data.frame(.mk_subset_region) |>
+                        tidyr::separate(Target, c("RepeatType", "RepeatClassFamily", "matchStart", "matchEnd"), sep = " ") |>
+                        tidyr::separate("RepeatClassFamily", c("RepeatClass", "RepeatFamily"), sep="/") |>
+                        tibble() |>
+                    #head(100) |>
+                    mutate(
+                        sample = samplename,
+                        subset_frac = str_remove(frac, "`")
+                    ) 
+                }
+            )  |> compact() |> list_rbind() 
+        }
+    ) |> list_rbind()
+
+df_frac_repeats
+
+map(
+    apply(combn(paste("frac", config$subsampling_fractions, sep="-"), 2),2,list),
+    ~ plot_frac_correlation(df_frac_repeats, "ITGRA1",
+        seqname = "chr20",
+        x = as.character(.x[[1]][[1]]),
+        y = as.character(.x[[1]][[2]]),
+        filename = "results/{samplename}-fraccor_repeats-{seqname}-{fname_part}.png")
+    )
+    ```
+## Per sample correlation
+
+
+
+# United datasets
+
+Merging across samples leads to a higher reduction of sites in shallow datasets. 
+
+```{r compare_unite, echo=F}
+df_united_stats <- map(
+    config$subsampling_fractions,
+    function(frac) {
+        read_table_ssh(
+            glue("/cluster/home/flamme/my-projects/wheatear-emseq-prod/results/wheatear_downsampling/frac-{frac}/methylkit/bismark/united.tsv")
+        ) |> mutate("frac" = frac)
+    }
+) |>
+    list_rbind() |>
+    relocate(frac, n_samples, min_per_group)
+
+df_united_stats
+```
+
+# Methylation levels at merged sites
+
+
+```{r get_data_united, echo=F}
+df_united <- map(
+    config$subsampling_fractions,
+    function(frac) {
+        read_table_ssh(
+            glue("/cluster/home/flamme/my-projects/wheatear-emseq-prod/results/wheatear_downsampling/frac-{frac}/methylkit/bismark/united_stats_per_chr.tsv")
+        ) |> mutate("frac" = frac)
+    }
+) |> list_rbind()
+```
+
+The global mCpG rate in the united datasets, depends highly on the inital threshold at which methylation calls are made. 
+
+If calls are made with a minimum threshold of 1 read, more 100% methylated sites are observed, compared to a higher threshold. 
+
+The following data is made with a threshold of 5 reads. 
+
+```{r, echo=F, fig.width=10}
+df_united |>
+    group_by(frac, sample, chr) |>
+    filter(str_starts(chr, "chr")) |>
+    summarize(mean_mCpG = mean(mean_mCpG), .groups = "keep") |>
+    ggplot(aes(x = chr, y = mean_mCpG)) +
+    geom_point(aes(color = frac)) +
+    facet_wrap(~sample, nrow = 1) +
+    coord_flip()
+
+
+df_united |>
+    group_by(frac, sample) |>
+    summarize(mean_mCpG = mean(mean_mCpG), .groups = "keep") |>
+    ggplot(aes(x = sample, y = mean_mCpG)) +
+    geom_point(aes(color = frac)) +
+    geom_line(aes(color = frac, group = frac)) +
+    coord_flip()
+```
+
+
+
+
+
+```{bash eval=FALSE, include=FALSE}
+
+scp euler.ethz.ch:/cluster/home/flamme/my-projects/wheatear-emseq-prod/results/wheatear_downsampling/frac-0.125/methylkit/bismark/df_mku.rds data/frac-0.125/df_mku.rds
+
+scp euler.ethz.ch:/cluster/home/flamme/my-projects/wheatear-emseq-prod/results/wheatear_downsampling/frac-0.25/methylkit/bismark/df_mku.rds data/frac-0.25/df_mku.rds
+
+scp euler.ethz.ch:/cluster/home/flamme/my-projects/wheatear-emseq-prod/results/wheatear_downsampling/frac-0.5/methylkit/bismark/df_mku.rds data/frac-0.5/df_mku.rds
+```
+
+```{r, echo=F}
+CHROMOSOME_LIST <- c("chr20", "chr5", "chrZ") # , "chr10", "chr20", "chr28", "chrZ")
+
+list_of_df_mku <- c("../data/frac-0.125/df_mku.rds",
+                    "../data/frac-0.25/df_mku.rds",
+                    "../data/frac-0.5/df_mku.rds")
+
+df_mku <-
+    list_of_df_mku |>
+    purrr::map(function(fpath) {
+        readRDS(fpath) |>
+            dplyr::filter(chr %in% CHROMOSOME_LIST) |>
+            dplyr::mutate(frac = str_extract(fpath, "frac-0.[0-9]+"))
+    }) |>
+    purrr::list_rbind()
+```
+
+# Coverage at merged sites
+
+```{r, echo=F}
+coverage <-
+    df_mku |>
+    pivot_wider(id_cols = c(sample, frac, chr, start), names_from = metric, values_from = value) |>
+    group_by(frac, sample) |>
+    drop_na() |>
+    summarize(mean_coverage = mean(coverage))
+
+df_mku |>
+    pivot_wider(id_cols = c(sample, frac, chr, start), names_from = metric, values_from = value) |>
+    drop_na() |>
+    ggplot(aes(x = coverage, y = numCs)) +
+    geom_point(aes(color = frac)) +
+    facet_grid(~frac) +
+    geom_smooth(method = "lm")
+
+
+coverage |> pivot_wider(id_cols = sample, names_from = frac, values_from = mean_coverage)
+```
+
+
+Which sites are covered at different fractions? 
+
+```{r, echo=F}
+df_ncovered <-
+    df_mku |>
+    filter(metric == "coverage") |>
+    pivot_wider(id_cols = c(frac, chr, start), names_from = c(metric, sample), values_from = value) |>
+    # create columns showing count of non-NA values
+    mutate(across(starts_with("coverage"), ~ as.numeric(!is.na(.x)), .names = "nonNA-{.col}")) |>
+    # count the number of TRUE values
+    mutate(n_covered = rowSums(across(starts_with("nonNA"))))
+
+
+df_ncovered |>
+    # filter chromosomes startin with "chr"
+    filter(str_starts(chr, "chr")) |>
+    left_join(df_genome |> filter(genome == "OenMel1.1") |> select(seqnames, CpG_count),
+        by = c("chr" = "seqnames")
+    ) |>
+    group_by(frac, chr) |>
+    reframe(n_covered_frac = sum(n_covered) / CpG_count) |>
+    unique() |>
+    # pivot_wider(id_cols = "chr", names_from = "frac", values_from = "n_covered_frac") |>
+    ggplot(aes(x = frac, y = n_covered_frac / 6)) +
+    geom_point() +
+    geom_smooth() +
+    facet_grid(~chr)
+```
+
