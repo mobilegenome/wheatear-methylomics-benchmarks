@@ -1,0 +1,406 @@
+---
+title: "Coverage analysis"
+output: 
+  html_document:
+    embed-resources: true
+    toc: yes
+    fig_caption: yes
+---
+
+
+Investigate the effect of sequencing depth on methylation analyses. 
+
+Here, I downsampled the high-coverage pilot dataset as shown in the following table. 
+
+The increase in coverage is not fully proportional to the subsampling fraction due to a increase
+in duplicates. 
+
+Note, that for this analysis the methylation calls have been **destranded**.
+
+```{r}
+#| label: load_libraries
+#| echo: false
+
+library(tidyverse)
+library(purrr)
+library(glue)
+library(here)
+library(wheatearcommons)
+library(GenomicRanges)
+```
+
+
+```{r}
+#| label: set_config
+#| echo: false
+
+config <- list(
+    "subsampling_fractions" = c("0.125", "0.25", "0.5"),
+    "base_dir" = "/cluster/home/flamme/my-projects/wheatear-emseq-prod/results/wheatear_downsampling",
+    "base_dir_prod" = "/cluster/home/flamme/my-data/processed/by-analysis/wheatear_indGenome_bismark/"
+)
+
+SEQNAMES_LIST <- c("chr1")
+COMPARISON <- c("frac-0.125", "frac-0.5")
+```
+
+
+::: {.callout .callout-info}
+
+**ANALYSIS on `{r} paste(SEQNAMES_LIST, collapse=", ")`**
+
+:::
+
+```{r eval=FALSE, include=FALSE}
+#| label: download-methylkit-data
+#| echo: false
+#| eval: false
+
+map(config$subsampling_fractions,
+  ~ system(glue(
+    "rsync euler.ethz.ch:/cluster/home/flamme/my-projects/wheatear-emseq-prod/results/wheatear_downsampling/frac-{.x}/methylkit/bismark/filtered_normalized.rds data/frac-{.x}/filtered_normalized.rds")
+    )
+)
+```
+
+
+```{r}
+#| label: functions-fractions-correlate
+#| echo: false
+
+source(here("analysis/functions.R"))
+
+```
+
+
+# Per site depth of coverage
+
+```{r}
+#| label: load-correlation-per-site
+#| echo: false
+#| eval: true
+
+source(here("analysis/functions.R"))
+
+mk_norm <- 
+    paste("frac", config$subsampling_fractions, sep="-") |>
+    map( ~ readRDS(here(glue("data/{.x}/filtered_normalized.rds")))) |>
+    setNames(paste("frac", config$subsampling_fractions, sep="-"))
+
+sample_names <- with(methylBenchmark, get_samplenames_from_mkobj(mk_norm))
+
+df_frac <- with(methylBenchmark, nested_methylKit_to_df(mk_norm, sample_names, config$subsampling_fractions))
+
+rm(mk_norm)
+gc()
+```
+
+
+```{r}
+#| label: process_data_correlation-per-site
+#| echo: false
+
+data <- df_frac |> 
+    filter(coverage > 10) |>
+    filter(seqnames %in% SEQNAMES_LIST)
+
+
+rm(df_frac)
+gc()
+
+data_wide <- with(methylBenchmark, widen_data(data))
+```
+
+To evaluate the effects of different sequencing depths, 
+I plot the correlation of per-site methylation levels between different fractions. 
+
+One example of this is shown in @fig-correlation-1: The plot shows a generally high correlation between high and low sequencing depths. 
+
+However, the plots also shows a higher deviation on sites that are called as 0% of 100% methylation in the low-coverage fraction. 
+
+```{r}
+#| label: fig-correlation-1
+#| echo: false
+
+p <- ggpubr::ggarrange(
+    plot_frac_correlation(data_wide |> drop_na(), "CNXS1", "chr20", "frac-0.125", "frac-0.25"),
+    plot_frac_correlation(data_wide |> drop_na(), "CNXS1", "chr20", "frac-0.125", "frac-0.5"),
+    plot_frac_correlation(data_wide |> drop_na(), "CNXS1", "chr20", "frac-0.25", "frac-0.5"),
+    nrow=3)
+
+ggsave("results/frac-correlation-1.png", p)
+```
+
+## Missing values
+
+How many sites covered at high sequencing depth are missing in at low depth?
+
+
+```{r}
+#| label: tbl-missing-values
+#| echo: false
+
+with(methylBenchmark, print_table_of_missing_sites(data_wide)) |>
+    t() |>
+    knitr::kable()
+```
+
+
+
+```{r}
+#| label: bin-data
+#| echo: false
+
+p <- with(methylBenchmark, plot_mean_mCpG_by_bin_along_chr(data))
+
+print(p)
+```
+
+
+```{r}
+#| label: bin-data-by-mCpG
+#| echo: false
+
+
+data_binned_by_methylation <- with(methylBenchmark, calculate_methylation_bins(data))
+
+na_counts <- with(methylBenchmark, calculate_na_counts(data_binned_by_methylation))
+
+na_counts |> t() |> knitr::kable()
+
+with(methylBenchmark, plot_boxplot_with_na_counts(data_binned_by_methylation, na_counts$perc_na_frac125))
+
+```
+
+
+```{r}
+#| label: conservation_analysis
+#| echo: false
+#| 
+
+df_cons <- with(methylBenchmark, calculate_conservation_score(data))
+with(methylBenchmark, plot_boxplot_conservation(df_cons))
+with(methylBenchmark, calculate_table_of_sites_present(df_cons))
+
+```
+
+# Per site in repeats
+
+
+
+```{r}
+#| label: subset-data-for-repeats
+#| echo: false
+
+
+gr_repeats <- readRDS(here("../wheatear-methylomics-analyze/data-cache/genome-annotation-repeats.rds"))
+
+# remove metadata from GenomicRanges object
+gr_repeats_simplified <- gr_repeats
+GenomicRanges::elementMetadata(gr_repeats_simplified) <- NULL
+gr_repeats_simplified <- gr_repeats_simplified[grepl("^chr", seqnames(gr_repeats))]
+
+
+gr_data <- GenomicRanges::makeGRangesFromDataFrame(data, keep.extra.columns = T)
+# subset data for repeats using plyranges
+gr_data_repeats <- plyranges::join_overlap_intersect(gr_data, gr_repeats)
+
+
+data_repeats <- GenomicRanges::as.data.frame(gr_data_repeats) |>
+                tidyr::separate(Target, c("RepeatType", "RepeatClassFamily", "matchStart", "matchEnd"), sep = " ") |>
+                tidyr::separate("RepeatClassFamily", c("RepeatClass", "RepeatFamily"), sep="/") |>
+                tibble() 
+
+data_repeats_filtered <- 
+    data_repeats |> 
+    dplyr::group_by(seqnames, start, sample, subset_frac) %>%
+    dplyr::mutate(n_repeat_overlaps = dplyr::n()) |> 
+    # mark overlapping repeats as complex
+    mutate(across(starts_with("Repeat"), ~ if_else(n_repeat_overlaps > 1, "complex", .x))) |>
+    ungroup() |>
+    filter(RepeatType != "complex")
+
+
+data_repeats_wide <- with(methylBenchmark, widen_data(data_repeats_filtered))
+
+with(methylBenchmark, calculate_na_counts(data_repeats_wide)) |> t()
+
+```
+
+
+## Per site depth of coverage in repeats
+
+
+```{r}
+#| label: fig-correlation-1-repeats
+#| echo: false
+
+p <- ggpubr::ggarrange(
+    plot_frac_correlation(data_repeats_wide |> drop_na(), "CNXS1", "chr20", "frac-0.125", "frac-0.25"),
+    plot_frac_correlation(data_repeats_wide |> drop_na(), "CNXS1", "chr20", "frac-0.125", "frac-0.5"),
+    plot_frac_correlation(data_repeats_wide |> drop_na(), "CNXS1", "chr20", "frac-0.25", "frac-0.5"),
+    nrow=3)
+
+ggsave("results/repeats-frac-correlation-1.png", p)
+```
+
+## Missing values
+
+How many sites covered at high sequencing depth are missing in at low depth?
+
+
+```{r}
+#| label: tbl-missing-values-repeats
+#| echo: false
+
+with(methylBenchmark, print_table_of_missing_sites(data_repeats_wide))  |> t()  |> knitr::kable()
+```
+
+
+
+```{r}
+#| label: bin-data-repeats
+#| echo: false
+
+p <- with(methylBenchmark, plot_mean_mCpG_by_bin_along_chr(data_repeats_filtered))
+print(p)
+```
+
+
+```{r}
+#| label: bin-data-by-mCpG-repeats
+#| echo: false
+
+data_binned_by_methylation <- with(methylBenchmark, calculate_methylation_bins(data_repeats_filtered)))
+
+na_counts_repeats <- with(methylBenchmark, calculate_na_counts(data_binned_by_methylation))
+
+na_counts_repeats |> t() |> knitr::kable()
+
+with(methylBenchmark, plot_boxplot_with_na_counts(data_binned_by_methylation, na_counts_repeats$perc_na_frac125))
+
+```
+
+
+```{r}
+#| label: conservation_analysis_repeats
+#| echo: false
+#| 
+
+df_cons <- with(methylBenchmark, calculate_conservation_score(data_repeats))
+with(methylBenchmark, plot_boxplot_conservation(df_cons))
+with(methylBenchmark, calculate_table_of_sites_present(df_cons))
+
+```
+
+### Conclusion
+
+For repeats, the variance in the binning analysis seems higher than for the whole-genome. Also the difference between 0.25 and 0.5X is higher for repeats. 
+The of number of missing values also seems to be higher for repeats. 
+
+
+# Genes
+
+
+
+```{r}
+#| label: subset-data-for-genes
+#| echo: false
+
+
+gr_genes <- readRDS(here("../wheatear-methylomics-analyze/data-cache/genome-annotation-genes.rds"))
+
+gr_genes <- gr_genes[gr_genes$type == "CDS"]
+
+
+
+gr_data <- GenomicRanges::makeGRangesFromDataFrame(data, keep.extra.columns = T)
+# subset data for repeats using plyranges
+gr_data_genes <- plyranges::join_overlap_intersect(gr_data, gr_genes)
+
+
+data_genes <- GenomicRanges::as.data.frame(gr_data_genes) |> tibble()
+
+data_genes_collapsed <- data_genes |> 
+    dplyr::group_by(seqnames, start, sample, type, subset_frac, numCs, end, numTs, coverage) |> 
+    nest() |> unnest_wider(data) |> ungroup()
+
+
+
+data_genes_wide <- with(methylBenchmark, widen_data(data_genes_collapsed))
+
+with(methylBenchmark, calculate_na_counts(data_genes_wide |> ungroup())) |> t()
+
+
+```
+
+
+
+
+## Per site depth of coverage in repeats
+
+
+```{r}
+#| label: fig-correlation-1-genes
+#| echo: false
+
+p <- ggpubr::ggarrange(
+    plot_frac_correlation(data_genes_wide |> drop_na(), "CNXS1", "chr20", "frac-0.125", "frac-0.25"),
+    plot_frac_correlation(data_genes_wide |> drop_na(), "CNXS1", "chr20", "frac-0.125", "frac-0.5"),
+    plot_frac_correlation(data_genes_wide |> drop_na(), "CNXS1", "chr20", "frac-0.25", "frac-0.5"),
+    nrow=3)
+
+ggsave("results/genes-frac-correlation-1.png", p)
+```
+
+## Missing values
+
+How many sites covered at high sequencing depth are missing in at low depth?
+
+
+```{r}
+#| label: tbl-missing-values-genes
+#| echo: false
+
+with(methylBenchmark, print_table_of_missing_sites(data_genes_wide)) |> t()  |> knitr::kable()
+```
+
+
+
+```{r}
+#| label: bin-data-genes
+#| echo: false
+
+p <- with(methylBenchmark, plot_mean_mCpG_by_bin_along_chr(data_genes_collapsed))
+print(p)
+```
+
+
+```{r}
+#| label: bin-data-by-mCpG-genes
+#| echo: false
+
+data_binned_by_methylation <- with(methylBenchmark, calculate_methylation_bins(data_genes_collapsed))
+
+na_counts_genes <- with(methylBenchmark, calculate_na_counts(data_binned_by_methylation))
+
+na_counts_genes |> t() |> knitr::kable()
+
+
+with(methylBenchmark, plot_boxplot_with_na_counts(data_binned_by_methylation, na_counts_genes$perc_na_frac125))
+
+```
+
+
+
+```{r}
+#| label: conservation_analysis_genes
+#| echo: false
+#| 
+
+df_cons <- with(methylBenchmark, calculate_conservation_score(data_genes_collapsed))
+with(methylBenchmark, plot_boxplot_conservation(df_cons))
+with(methylBenchmark, calculate_table_of_sites_present(df_cons))
+
+```
+

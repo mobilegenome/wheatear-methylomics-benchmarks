@@ -1,7 +1,8 @@
 ---
 title: "Coverage analysis"
 output: 
-  html_document: 
+  html_document:
+    embed-resources: yes
     toc: yes
     fig_caption: yes
 ---
@@ -23,6 +24,7 @@ Note, that for this analysis the methylation calls have been **destranded**.
 library(tidyverse)
 library(purrr)
 library(glue)
+library(here)
 library(wheatearcommons)
 ```
 
@@ -97,7 +99,7 @@ df_mqc |>
 ## Number of CpGs
 
 ```{r}
-#| label: n_cpgs
+#| label: load_n_cpgs
 #| echo: false
 
 df_cpg <- read_tsv("/home/fritjof/my-data/genomes/by-refmake/Oenanthe_melanoleuca/OenMel1.1/OenMel1.1/cpg_positions.bed.gz")
@@ -128,6 +130,12 @@ df_norm <- map(
 ) |>
     list_rbind() |>
     relocate(frac)
+```
+
+
+```{r}
+#| label: plt-coverage-nCpG
+#| echo: false
 
 df_norm |>
     left_join(df_mqc, by = c("sample" = "Sample", "frac" = "frac")) |>
@@ -392,6 +400,7 @@ but somewhat more spurious in the 0.125 fraction.
 
 ```{r, echo=F}
 #| label: plt-methylation-per-sample
+#| echo: false
 df_norm |>
     left_join(df_mqc, by = c("sample" = "Sample", "frac" = "frac")) |>
     ggplot(aes(x = reorder(sample, mean_coverage), y = mean_mCpG, color = frac)) +
@@ -404,7 +413,7 @@ df_norm |>
 ```{r eval=FALSE, include=FALSE}
 #| label: download-methylkit-data
 #| echo: false
-#| 
+#| eval: false
 
 map(config$subsampling_fractions,
   ~ system(glue(
@@ -414,384 +423,16 @@ map(config$subsampling_fractions,
 ```
 
 
-```{r}
-#| label: functions-fractions-correlate
-#| echo: false
 
-library(GenomicRanges)
 
-
-#' Plots the fraction correlation between two variables for a specific sample and sequence ----
-#'
-#' Assumes chromosome/contig in column "seqnames"
-#' 
-#' @param .data The data frame containing the relevant data.
-#' @param samplename The name of the sample to filter the data for.
-#' @param seqname The name of the sequence to filter the data for.
-#' @param x The name of the variable to plot on the x-axis.
-#' @param y The name of the variable to plot on the y-axis.
-plot_frac_correlation <- function(data_wide,
-    samplename,
-    seqname,
-    x,
-    y) {
-
-    p <- ggplot(data_wide,
-        aes(
-            x=!!sym(x),
-            y=!!sym(y))
-        ) + 
-        geom_point() + 
-        geom_smooth(method="lm") + 
-        ggtitle(glue("{samplename} - {y} vs {x} - {seqname}"))
-
-        gc() 
-
-        return(p)
-}
-
-widen_data <- function(data) {
-    data_wide <-
-        data |>
-        # calculate mCpG
-        mutate(mCpG = numCs / coverage) |>
-        select(seqnames, start, coverage, mCpG, sample, subset_frac) |>
-        pivot_wider(id_cols = c(seqnames, start, sample), names_from = subset_frac, values_from = mCpG)
-    return(data_wide)
-
-}
-
-get_correlation <- function(data_wide, x_lab, y_lab) {
-
-    # calculate correlation coefficient and p-value between the two fractions
-    cor.test(
-        data_wide[[x_lab]],
-        data_wide[[y_lab]]) |>
-        broom::tidy() |>
-        dplyr::select(estimate, p.value) 
-}
-
-
-get_relative_error <- function(data_wide, x, y) {
-    
-    data_wide |>
-        left_join(
-            wheatearcommons::df_genome |> 
-                dplyr::filter(genome == "OenMel1.1") |> 
-                select(seqnames, seqlength)
-        ) |>
-        select(seqnames, seqlength, start, sample, !!sym(x), !!sym(y)) |>
-        group_by(seqnames, sample, seqlength) |>
-        mutate(diff = !!sym(x) - !!sym(y)) |>
-        mutate(is_FN = if_else(!!sym(x) == 0 & !!sym(y) > 0, 1, 0))
-}
-
-# Plot by position
-plot_frac_correlation_by_pos <- function(
-    data_long,
-    samplename,
-    seqname,
-    x,
-    y,
-    filename = "results/{samplename}-fraccor_pos-{seqname}-{fname_part}.png"
-    ) {
-    
-    seqlength <- wheatearcommons::df_genome |> 
-        dplyr::filter(genome == "OenMel1.1", 
-        seqnames == seqname) |> 
-        dplyr::pull(seqlength)
-
-
-
-    data_long |>
-        dplyr::filter(sample == samplename) |>
-        dplyr::filter(str_starts(seqnames, "chr")) |>
-        left_join(
-            wheatearcommons::df_genome |> 
-                dplyr::filter(genome == "OenMel1.1") |> 
-                select(seqnames, seqlength)
-        ) |>
-        #dplyr::filter(str_detect(chr, seqname)) |>
-        # calculate mCpG
-        mutate(
-            mCpG = numCs / coverage,
-            #start = round(start/seqlength*100),5)
-            ) |> 
-        select(seqnames,seqlength, start, coverage, mCpG, sample, subset_frac) |>
-        filter(subset_frac %in% c(x, y)) |>
-        group_by(seqnames, subset_frac) |>
-        mutate(bin = cut_width(start, width=1e5, labels=FALSE)) |> 
-        group_by(bin,seqnames,seqlength, subset_frac) |>
-        summarize(mCpG = mean(mCpG)) |> 
-        pivot_wider(id_cols = c(seqnames, bin, seqlength), names_from = subset_frac, values_from = mCpG) |>
-        mutate(rel_error = (!!sym(x) - !!sym(y)) / !!sym(x)) |>
-        # caluclate difference between fractions 
-        ggplot(aes(
-            x=bin,
-            y=reorder(seqnames, seqlength),
-            fill=rel_error)
-        ) + 
-        colorspace::scale_fill_continuous_diverging() + 
-        geom_tile() + 
-        ggtitle(samplename) -> p
-
-        gc() 
-
-        fname_part <- paste(str_extract(x, "[0-9\\.]+"), "-", str_extract(y, "[0-9\\.]+"), sep="")
-
-        return(p)
-}
-```
-
-```{r}
-#| label: prep-frac-correlation-data
-#| echo: false
-
-
-# load data into a list
-# returns a nested lists of methylkit objects
-mk_norm <- 
-    paste("frac", config$subsampling_fractions, sep="-") |>
-    map( ~ readRDS(glue("data/{.x}/filtered_normalized.rds"))) |>
-    setNames(paste("frac", config$subsampling_fractions, sep="-"))
-
-# get list of sample names
-sample_names <-
-    map(mk_norm, ~ methylKit::getSampleID(.x)) |> 
-    unique() |>
-    unlist()
-
-# get chromosome list
-chromosome_list <- wheatearcommons::df_genome |> 
-        dplyr::filter(genome == "OenMel1.1") |> 
-        dplyr::filter(str_starts(seqnames, "chr")) |>
-        pull(seqnames)
-
-# transform methylkit objects to a merged data.frame
-# this might be memory intensive
-df_frac <- imap(sample_names,
-    function (samplename, sample_idx) {
-        map(
-            paste("frac", config$subsampling_fractions, sep="-"),
-            function (frac) {
-                methylKit::getData(mk_norm[[frac]][[sample_idx]]) |>
-                #head(100) |>
-                mutate(
-                    sample = samplename,
-                    subset_frac = str_remove(frac, "`")
-                ) 
-            }
-        )  |> 
-        compact() |>
-        list_rbind() 
-    }
-
-) |> 
-list_rbind()
-
-
-```
-
-
-```{r}
-#| label: test-frac-correlation
-#| echo: false  
-#| eval: false
-
-data <- df_frac |> 
-    dplyr::rename("seqnames" = "chr") |>
-    filter(str_starts(seqnames, "chr"),
-           sample == "CNXS1",
-           seqnames != "chrM")
-rm(df_frac)
-gc()
-
-get_correlation(widen_data(data), "frac-0.125","frac-0.5")
-
-plot_frac_correlation_by_pos(
-    data |> filter(seqnames == "chr1"), 
-    "CNXS1",
-    seqname = "chr20",
-    x = "frac-0.125",
-    y = "frac-0.5"
-)
-
-
-data |> filter(
-    seqnames == "chr20", 
-    coverage >= 10) -> data
-
-data |> pull(subset_frac) |> table()
-
-# try working with a model
-data |> 
-    filter(subset_frac %in% c("frac-0.125", "frac-0.5")) |>
-    group_by(seqnames, start) |>
-    filter(n() == 2) |>
-    ungroup()  -> data_model
-
-nrow(data_model)
-fit_model <- function(data) {
-    model <- lm(
-        gtools::logit(numCs / (numCs + numTs)) ~  subset_frac, data) |> 
-        broom::tidy()
-    return(model)
-}
-
-model_results <- 
-    data_model |>
-        # see Gemini, this fixes infiite logit values
-        mutate(across(contains("num"), ~ if_else(.x == 0, 0.0001, .x))) |>
-        group_by(seqnames, start) |>
-        nest() |>
-        mutate(fitted = map(data, fit_model)) |>
-        unnest(fitted)
-
-model_results |> 
-    mutate(p.value.adj = p.adjust(p.value, method = "BH")) |>
-    filter(term != "(Intercept)") |>
-    filter(p.value.adj < 0.05) -> model_results_sig
-
-
-p.values <- p.adjust(summary(model)$coefficients[, "Pr(>|z|)"], method = "BH")
-significant_sites <- methylation_data[p.values < 0.05, ] 
-lrt <- anova(null, model)
-
-rdf <- df.residual(model)
-
-rp <- residuals(model, type = "pearson")
-Pearson.chisq <- sum(rp^2)
-Pearson.chisq/rdf #dispersion ratio
-
-summary(model)
-data |> filter(subset_frac == "frac-0.125") |> pull(coverage) |> summary()
-
-```
-
-```{r}
-# create plots
-# this is a nested map function running on
-# 1. chromosomes (n=30)
-# 2. fractions combination (n=3)
-# 3. samples (n=6)
-# total: 540 plots
-
-for (.samplename in sample_names) {
-
-    dir.create(glue("results/{.samplename}"), recursive = T, showWarnings = F) 
-    
-    map(chromosome_list,
-        function (.seqname) {
-        map(
-            apply(combn(paste("frac", config$subsampling_fractions, sep="-"), 2),2,list),
-            ~ {
-                
-                x_data <- as.character(.x[[1]][[1]])
-                y_data <- as.character(.x[[1]][[2]])
-
-                fname_part <- paste(str_extract(x_data, "[0-9\\.]+"), "-", str_extract
-                (y_data, "[0-9\\.]+"), sep="")
-
-                data_long <- df_frac |> rename("seqnames" = "chr"),
-                data_wide <- widen_data(data_long)
-                data_corr <- get_correlation(
-                    data_wide |> filter(seqnames == .seqname),
-                    x_lab = x_data,
-                    y_lab = y_data
-                ) |> 
-                 mutate(
-                    sample = .samplename,
-                    seqname = .seqname,
-                    fname_part = fname_part)
-
-                # p <- plot_frac_correlation(
-                #     data_wide
-                #     .samplename,
-                #     seqname = .seqname,
-                #     x = x_data,
-                #     y = y_data
-                # )
-
-                # ggsave(
-                #     filename = glue("frac_corr_{fname_part}.png"),
-                #     plot = p,
-                #     path = glue("results/{.samplename}/{.seqname}/")
-                # )
-            }
-            )
-        }
-    )
-}
-
-df_frac_corr <- map(sample_names,
-        function (.samplename) {
-            map(
-            apply(combn(paste("frac", config$subsampling_fractions, sep="-"), 2),2,list),
-            ~ {
-                
-                x_data <- as.character(.x[[1]][[1]])
-                y_data <- as.character(.x[[1]][[2]])
-
-                data_long <- df_frac |> 
-                    dplyr::rename("seqnames" = "chr") |> 
-                    filter(sample == .samplename) |>
-                    filter(str_starts(seqnames, "chr")) |>
-                    # exclude mitochondrial chromosome
-                    filter(seqnames != "chrM")
-    
-                data_wide <- widen_data(data_long)
-                
-                get_correlation(
-                    data_wide,
-                    x_lab = x_data,
-                    y_lab = y_data
-                ) |> 
-                mutate(
-                    comp = paste(
-                        str_extract(x_data, "[0-9\\.]+"),
-                        "-",
-                        str_extract(y_data, "[0-9\\.]+"),
-                    sep=""),
-                    sample = .samplename,
-                    seqnames = "all_chr"
-                )
-            }
-
-            ) |> list_rbind()
-        }
-    ) |> list_rbind()
-
-df_frac_corr |>
-ggplot(aes(x=comp, y=estimate, color=sample)) + 
-geom_point()
-
-
-
-map(
-    apply(combn(paste("frac", config$subsampling_fractions, sep="-"), 2),2,list),
-    ~ plot_frac_correlation_by_pos(df_frac, "ITGRA1",
-        seqname = .seqname,
-        x = as.character(.x[[1]][[1]]),
-        y = as.character(.x[[1]][[2]]))
-    )
-}
-)
-
-```
-
-
-```{r}
-# get landscape of coverage and methylation rates
-df_frac
-
-
-```
 
 ## Subset by region
 
 
 ```{r}
-
+#| label: subset_by_region
+#| echo: false
+#| eval: false
 
 gr_repeats <- readRDS("../wheatear-methylomics-analyze/data-cache/genome-annotation-repeats.rds")
 
