@@ -8,7 +8,7 @@ methylBenchmark$nested_methylKit_to_df <- function(mk_obj, sample_names, subsamp
                 paste("frac", subsampling_frac_list, sep="-"), 
                 function (frac) {
                     methylKit::getData(mk_obj[[frac]][[sample_idx]]) |>
-                    #head(100) |>
+                    #head(100) |>    
                     dplyr::rename("seqnames" = "chr") |>
                     dplyr::mutate(
                         sample = samplename,
@@ -151,9 +151,7 @@ methylBenchmark$print_table_of_missing_sites <- function(data_wide) {
                 TRUE ~ "no-missing")) |>
         group_by(missing) |>
         summarize(n = n()) |>
-        mutate(perc = round(100*(n/sum(n)),2)) |> 
-        janitor::adorn_totals("row") |>
-        knitr::kable()
+        mutate(perc = round(100*(n/sum(n)),2))
 }
 
 
