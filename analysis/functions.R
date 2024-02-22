@@ -134,8 +134,7 @@ methylBenchmark$calculate_table_of_sites_present <- function(df_cons) {
         # calculate percentage per subset_frac
         summarize(n = n()) |>
         pivot_wider(names_from = conservation_bin, values_from = n) |>
-        janitor::adorn_totals("col") |>
-        knitr::kable()
+        janitor::adorn_totals("col") 
 }
 
 
